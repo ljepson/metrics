@@ -1,0 +1,41 @@
+networks:
+  traefik-net:
+    external: true
+  immich-internal:
+    external: true
+    name: immich_immich-internal
+
+services:
+  metrics:
+    build: .
+    container_name: metrics-api
+    restart: unless-stopped
+    networks:
+      - traefik-net
+      - immich-internal
+    environment:
+      - PORT=8090
+      # Immich database connection (via immich-internal network)
+      - DB_HOST=immich_postgres
+      - DB_PORT=5432
+      - DB_NAME=immich
+      - DB_USER=immich
+      - DB_PASS=immich
+      # CloudFlare API
+      - CF_ZONE_ID=38aa1cdf7fdd9ee1a7fc14778549362a
+      - CF_API_KEY=2lF5gpztqdL9Y6ahId-TyfVBHLvuIBL3HvC_eo7C
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import requests; requests.get('http://127.0.0.1:8090/health', timeout=5)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=traefik-net"
+      - "traefik.http.routers.metrics.rule=Host(`metrics.jepson.live`)"
+      - "traefik.http.routers.metrics.entrypoints=websecure"
+      - "traefik.http.routers.metrics.tls.certresolver=letsencrypt"
+      # No authentication - monitoring endpoint (can add authentik@file if needed)
+      - "traefik.http.routers.metrics.service=metrics-svc"
+      - "traefik.http.services.metrics-svc.loadbalancer.server.port=8090"
