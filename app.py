@@ -7,6 +7,10 @@ Provides metrics endpoints for monitoring dashboard
 import os
 import json
 import requests
+import subprocess
+import shutil
+import ssl
+import socket
 from datetime import datetime, timedelta
 from flask import Flask, jsonify
 import psycopg2
@@ -281,6 +285,218 @@ query ZoneAnalytics($zoneTag: String!, $start: Time!) {
         return {'error': str(e), 'configured': bool(CF_API_KEY and CF_ZONE_ID)}
 
 
+def check_database_health():
+    """Check health of PostgreSQL databases"""
+    databases = [
+        {'name': 'immich', 'host': 'immich_postgres', 'port': 5432, 'user': 'immich'},
+        {'name': 'mother', 'host': '192.168.50.4', 'port': 15433, 'user': 'mother'},
+        {'name': 'rum', 'host': '192.168.50.4', 'port': 5435, 'user': 'rumuser'},
+    ]
+
+    results = []
+    healthy_count = 0
+
+    for db in databases:
+        try:
+            conn = psycopg2.connect(
+                host=db['host'],
+                port=db['port'],
+                database=db['name'],
+                user=db['user'],
+                password=db.get('password', db['user']),
+                connect_timeout=5
+            )
+            cur = conn.cursor()
+            cur.execute('SELECT 1')
+            cur.fetchone()
+            cur.close()
+            conn.close()
+
+            results.append({
+                'name': db['name'],
+                'status': 'healthy',
+                'host': db['host'],
+                'port': db['port']
+            })
+            healthy_count += 1
+        except Exception as e:
+            results.append({
+                'name': db['name'],
+                'status': 'unhealthy',
+                'error': str(e),
+                'host': db['host'],
+                'port': db['port']
+            })
+
+    overall_status = 'healthy' if healthy_count == len(databases) else ('warning' if healthy_count > 0 else 'critical')
+
+    return {
+        'status': overall_status,
+        'healthy': healthy_count,
+        'total': len(databases),
+        'databases': results
+    }
+
+
+def check_docker_services():
+    """Check Docker container health"""
+    try:
+        result = subprocess.run(
+            ['docker', 'ps', '--format', '{{.Names}}::{{.Status}}::{{.State}}'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            return {'status': 'unknown', 'error': 'Failed to query Docker', 'note': 'Docker CLI not available in container'}
+
+        containers = []
+        healthy_count = 0
+        running_count = 0
+
+        for line in result.stdout.strip().split('\n'):
+            if not line:
+                continue
+            parts = line.split('::')
+            if len(parts) >= 3:
+                name, status, state = parts[0], parts[1], parts[2]
+                is_healthy = 'healthy' in status.lower() or state == 'running'
+                is_running = state == 'running'
+
+                containers.append({
+                    'name': name,
+                    'status': status,
+                    'state': state,
+                    'healthy': is_healthy
+                })
+
+                if is_healthy:
+                    healthy_count += 1
+                if is_running:
+                    running_count += 1
+
+        overall_status = 'healthy' if healthy_count == len(containers) else ('warning' if running_count > 0 else 'critical')
+
+        return {
+            'status': overall_status,
+            'total': len(containers),
+            'running': running_count,
+            'healthy': healthy_count,
+            'containers': containers
+        }
+    except FileNotFoundError:
+        return {'status': 'unknown', 'error': 'Docker CLI not installed', 'note': 'Use Prometheus/Grafana for container metrics'}
+    except Exception as e:
+        return {'status': 'unknown', 'error': str(e)}
+
+
+def check_disk_usage():
+    """Check disk usage for critical mount points"""
+    mount_points = [
+        '/',
+        '/srv',
+    ]
+
+    results = []
+    critical_count = 0
+    warning_count = 0
+
+    for mount in mount_points:
+        try:
+            stat = shutil.disk_usage(mount)
+            total_gb = stat.total / (1024**3)
+            used_gb = stat.used / (1024**3)
+            free_gb = stat.free / (1024**3)
+            percent_used = (stat.used / stat.total) * 100
+
+            if percent_used >= 90:
+                status = 'critical'
+                critical_count += 1
+            elif percent_used >= 80:
+                status = 'warning'
+                warning_count += 1
+            else:
+                status = 'healthy'
+
+            results.append({
+                'mount_point': mount,
+                'status': status,
+                'total_gb': round(total_gb, 2),
+                'used_gb': round(used_gb, 2),
+                'free_gb': round(free_gb, 2),
+                'percent_used': round(percent_used, 1)
+            })
+        except Exception as e:
+            results.append({
+                'mount_point': mount,
+                'status': 'error',
+                'error': str(e)
+            })
+            critical_count += 1
+
+    overall_status = 'critical' if critical_count > 0 else ('warning' if warning_count > 0 else 'healthy')
+
+    return {
+        'status': overall_status,
+        'mount_points': results
+    }
+
+
+def check_ssl_certificates():
+    """Check SSL certificate expiration for *.jepson.live domains"""
+    domains = [
+        'metrics.jepson.live',
+        'grafana.jepson.live',
+        'rum.jepson.live',
+        'uptime.jepson.live',
+        'photos.jepson.live',
+    ]
+
+    results = []
+    warning_count = 0
+    critical_count = 0
+
+    for domain in domains:
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection((domain, 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                    cert = ssock.getpeercert()
+                    expiry_date = datetime.strptime(cert['notAfter'], '%b %d %H:%M:%S %Y %Z')
+                    days_until_expiry = (expiry_date - datetime.utcnow()).days
+
+                    if days_until_expiry < 7:
+                        status = 'critical'
+                        critical_count += 1
+                    elif days_until_expiry < 30:
+                        status = 'warning'
+                        warning_count += 1
+                    else:
+                        status = 'healthy'
+
+                    results.append({
+                        'domain': domain,
+                        'status': status,
+                        'days_until_expiry': days_until_expiry,
+                        'expiry_date': expiry_date.isoformat()
+                    })
+        except Exception as e:
+            results.append({
+                'domain': domain,
+                'status': 'error',
+                'error': str(e)
+            })
+            critical_count += 1
+
+    overall_status = 'critical' if critical_count > 0 else ('warning' if warning_count > 0 else 'healthy')
+
+    return {
+        'status': overall_status,
+        'certificates': results
+    }
+
+
 @app.route('/health', methods=['GET', 'HEAD'])
 def health():
     """Health check endpoint"""
@@ -309,6 +525,42 @@ def all_metrics():
         'timestamp': datetime.utcnow().isoformat(),
         'immich': get_immich_metrics(),
         'cloudflare': get_cloudflare_metrics()
+    })
+
+
+@app.route('/health/database', methods=['GET', 'HEAD'])
+def health_database():
+    """Database health check endpoint for Uptime Kuma"""
+    return jsonify(check_database_health())
+
+
+@app.route('/health/services', methods=['GET', 'HEAD'])
+def health_services():
+    """Docker services health check endpoint for Uptime Kuma"""
+    return jsonify(check_docker_services())
+
+
+@app.route('/health/disk', methods=['GET', 'HEAD'])
+def health_disk():
+    """Disk usage health check endpoint for Uptime Kuma"""
+    return jsonify(check_disk_usage())
+
+
+@app.route('/health/ssl', methods=['GET', 'HEAD'])
+def health_ssl():
+    """SSL certificate expiration check endpoint for Uptime Kuma"""
+    return jsonify(check_ssl_certificates())
+
+
+@app.route('/health/all', methods=['GET', 'HEAD'])
+def health_all():
+    """Combined health checks for comprehensive monitoring"""
+    return jsonify({
+        'timestamp': datetime.utcnow().isoformat(),
+        'database': check_database_health(),
+        'services': check_docker_services(),
+        'disk': check_disk_usage(),
+        'ssl': check_ssl_certificates()
     })
 
 

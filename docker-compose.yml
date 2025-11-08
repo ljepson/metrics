@@ -13,6 +13,8 @@ services:
     networks:
       - traefik-net
       - immich-internal
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - PORT=8090
       # Immich database connection (via immich-internal network)
